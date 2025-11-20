@@ -1,0 +1,159 @@
+name: Release Operator & Helm Chart
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+
+permissions:
+  contents: read
+  packages: write  # Required for GHCR pushes
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/vibe/registry-operator
+  CHART_OCI_REPO: oci://ghcr.io/vibe/charts
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go (latest stable)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      # - name: Run tests (Kubebuilder default)
+      #   run: make test
+
+      - name: Compute versions
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME}"          # v1.2.3
+            CHART_VERSION="${GITHUB_REF_NAME#v}"  # 1.2.3
+            APP_VERSION="${GITHUB_REF_NAME}"      # v1.2.3
+          else
+            VERSION="0.0.0-${GITHUB_SHA}"
+            CHART_VERSION="$VERSION"
+            APP_VERSION="$VERSION"
+          fi
+
+          {
+            echo "VERSION=$VERSION"
+            echo "CHART_VERSION=$CHART_VERSION"
+            echo "APP_VERSION=$APP_VERSION"
+          } >> "$GITHUB_ENV"
+
+          echo "Computed versions:"
+          echo "  VERSION=$VERSION"
+          echo "  CHART_VERSION=$CHART_VERSION"
+          echo "  APP_VERSION=$APP_VERSION"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR (Docker)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern=v{{version}}
+            type=sha,format=long
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+            ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Install Kubebuilder CLI
+        run: |
+          KUBEBUILDER_VERSION=v4.10.1
+
+          curl -L "https://github.com/kubernetes-sigs/kubebuilder/releases/download/${KUBEBUILDER_VERSION}/kubebuilder_linux_amd64" -o kubebuilder
+
+          chmod +x kubebuilder
+          sudo mv kubebuilder /usr/local/bin/kubebuilder
+
+          kubebuilder version
+
+      - name: Generate Helm Chart via Kubebuilder plugin
+        run: |
+          kubebuilder edit --plugins=helm/v1-alpha
+          ls -R dist || true
+          echo "Chart directory generated at dist/chart"
+
+      - name: Helm lint
+        run: helm lint dist/chart
+
+      - name: Install yq
+        run: |
+          sudo wget -q https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
+            -O /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Package and Push Helm Chart
+        env:
+          VERSION: ${{ env.VERSION }}
+          CHART_VERSION: ${{ env.CHART_VERSION }}
+          APP_VERSION: ${{ env.APP_VERSION }}
+        run: |
+          echo "Packaging and pushing chart:"
+          echo "  Chart Version: $CHART_VERSION"
+          echo "  App Version:   $APP_VERSION"
+          echo "  Image Tag:     $VERSION"
+
+          # Login to GHCR for Helm OCI
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login "${REGISTRY}" \
+            --username "${{ github.actor }}" \
+            --password-stdin
+
+          # Update Helm values.yaml via yq - NOTE: correct keys for kubebuilder helm plugin
+          yq -i '.controllerManager.container.image.repository = env(IMAGE_NAME)' dist/chart/values.yaml
+          yq -i '.controllerManager.container.image.tag = env(VERSION)' dist/chart/values.yaml
+
+          # Build chart package
+          helm package dist/chart \
+            --version "$CHART_VERSION" \
+            --app-version "$APP_VERSION"
+
+          # Extract chart name
+          PKG_NAME=$(yq '.name' dist/chart/Chart.yaml)
+
+          # Push chart to GHCR OCI repo
+          helm push "${PKG_NAME}-${CHART_VERSION}.tgz" "${CHART_OCI_REPO}"
